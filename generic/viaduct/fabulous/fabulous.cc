@@ -42,6 +42,29 @@
 NEXTPNR_NAMESPACE_BEGIN
 
 namespace {
+
+struct TimingParams
+{
+    // Router/global params
+    float delay_scale = 3.0;
+    float delay_offset = 3.0;
+    float delay_epsilon = 0.25;
+    float ripup_penalty = 0.5;
+    // Carry chain
+    float carry_ci_co = 0.2;
+    float carry_i_co = 1.0;
+    // Flip-flop
+    float ff_setup = 2.5;
+    float ff_hold = 0.1;
+    float ff_clk_q = 1.0;
+    // LUT combinational
+    float lut_delay = 3.0;
+    // IO pass cells
+    float io_setup = 2.5;
+    float io_hold = 0.1;
+    float io_clk_out = 2.5;
+};
+
 struct FabulousImpl : ViaductAPI
 {
     FabulousImpl(const dict<std::string, std::string> &args)
@@ -78,9 +101,10 @@ struct FabulousImpl : ViaductAPI
         init_pips();
         init_pseudo_constant_wires();
         setup_lut_permutation();
-        ctx->setDelayScaling(3.0, 3.0);
-        ctx->delay_epsilon = 0.25;
-        ctx->ripup_penalty = 0.5;
+        load_timing_params();
+        ctx->setDelayScaling(tp.delay_scale, tp.delay_offset);
+        ctx->delay_epsilon = tp.delay_epsilon;
+        ctx->ripup_penalty = tp.ripup_penalty;
     }
 
     void init_default_ctrlset_cfg()
@@ -107,29 +131,29 @@ struct FabulousImpl : ViaductAPI
             if (ci->type == id_FABULOUS_LC) {
                 auto &lct = cell_tags.get(ci);
                 if (lct.comb.carry_used) {
-                    ctx->addCellTimingDelay(ci->name, id_Ci, id_Co, 0.2);
-                    ctx->addCellTimingDelay(ci->name, ctx->id("I1"), id_Co, 1.0);
-                    ctx->addCellTimingDelay(ci->name, ctx->id("I2"), id_Co, 1.0);
+                    ctx->addCellTimingDelay(ci->name, id_Ci, id_Co, tp.carry_ci_co);
+                    ctx->addCellTimingDelay(ci->name, ctx->id("I1"), id_Co, tp.carry_i_co);
+                    ctx->addCellTimingDelay(ci->name, ctx->id("I2"), id_Co, tp.carry_i_co);
                 }
                 if (lct.ff.ff_used) {
                     ctx->addCellTimingClock(ci->name, id_CLK);
                     for (unsigned i = 0; i < cfg.clb.lut_k; i++)
-                        ctx->addCellTimingSetupHold(ci->name, ctx->idf("I%d", i), id_CLK, 2.5, 0.1);
-                    ctx->addCellTimingClockToOut(ci->name, id_Q, id_CLK, 1.0);
+                        ctx->addCellTimingSetupHold(ci->name, ctx->idf("I%d", i), id_CLK, tp.ff_setup, tp.ff_hold);
+                    ctx->addCellTimingClockToOut(ci->name, id_Q, id_CLK, tp.ff_clk_q);
                     if (bool_or_default(ci->params, id_I0MUX))
-                        ctx->addCellTimingSetupHold(ci->name, id_Ci, id_CLK, 2.5, 0.1);
+                        ctx->addCellTimingSetupHold(ci->name, id_Ci, id_CLK, tp.ff_setup, tp.ff_hold);
                 } else {
                     for (unsigned i = 0; i < cfg.clb.lut_k; i++)
-                        ctx->addCellTimingDelay(ci->name, ctx->idf("I%d", i), id_O, 3.0);
+                        ctx->addCellTimingDelay(ci->name, ctx->idf("I%d", i), id_O, tp.lut_delay);
                     if (bool_or_default(ci->params, id_I0MUX))
-                        ctx->addCellTimingDelay(ci->name, id_Ci, id_O, 3.0);
+                        ctx->addCellTimingDelay(ci->name, id_Ci, id_O, tp.lut_delay);
                 }
             } else if (ci->type.in(id_OutPass4_frame_config, id_OutPass4_frame_config_mux)) {
                 for (unsigned i = 0; i < 4; i++)
-                    ctx->addCellTimingSetupHold(ci->name, ctx->idf("I%d", i), id_CLK, 2.5, 0.1);
+                    ctx->addCellTimingSetupHold(ci->name, ctx->idf("I%d", i), id_CLK, tp.io_setup, tp.io_hold);
             } else if (ci->type.in(id_InPass4_frame_config, id_InPass4_frame_config_mux)) {
                 for (unsigned i = 0; i < 4; i++)
-                    ctx->addCellTimingClockToOut(ci->name, ctx->idf("O%d", i), id_CLK, 2.5);
+                    ctx->addCellTimingClockToOut(ci->name, ctx->idf("O%d", i), id_CLK, tp.io_clk_out);
             }
         }
     }
@@ -162,6 +186,7 @@ struct FabulousImpl : ViaductAPI
   private:
     FabricConfig cfg; // TODO: non-default config
     ViaductHelpers h;
+    TimingParams tp;
 
     std::string fasm_file;
 
@@ -175,6 +200,55 @@ struct FabulousImpl : ViaductAPI
         if (var == nullptr)
             log_error("environment variable '%s' is not set%s\n", name.c_str(), prompt.c_str());
         return std::string(var);
+    }
+
+    void load_timing_params()
+    {
+        const std::string filename = fab_root + "/timing.cfg";
+        std::ifstream in(filename);
+        if (!in) {
+            log_info("No timing.cfg found in FAB_ROOT, using default timing parameters.\n");
+            return;
+        }
+        log_info("Loading timing parameters from '%s'.\n", filename.c_str());
+        std::string line;
+        while (std::getline(in, line)) {
+            // strip comments and whitespace
+            auto comment = line.find('#');
+            if (comment != std::string::npos)
+                line = line.substr(0, comment);
+            auto eq = line.find('=');
+            if (eq == std::string::npos)
+                continue;
+            std::string key = line.substr(0, eq);
+            std::string val = line.substr(eq + 1);
+            // trim whitespace
+            auto trim = [](std::string &s) {
+                size_t a = s.find_first_not_of(" \t\r\n");
+                size_t b = s.find_last_not_of(" \t\r\n");
+                s = (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
+            };
+            trim(key);
+            trim(val);
+            if (key.empty() || val.empty())
+                continue;
+            float v = std::stof(val);
+            if (key == "delay_scale")         tp.delay_scale = v;
+            else if (key == "delay_offset")   tp.delay_offset = v;
+            else if (key == "delay_epsilon")  tp.delay_epsilon = v;
+            else if (key == "ripup_penalty")  tp.ripup_penalty = v;
+            else if (key == "carry_ci_co")    tp.carry_ci_co = v;
+            else if (key == "carry_i_co")     tp.carry_i_co = v;
+            else if (key == "ff_setup")       tp.ff_setup = v;
+            else if (key == "ff_hold")        tp.ff_hold = v;
+            else if (key == "ff_clk_q")       tp.ff_clk_q = v;
+            else if (key == "lut_delay")      tp.lut_delay = v;
+            else if (key == "io_setup")       tp.io_setup = v;
+            else if (key == "io_hold")        tp.io_hold = v;
+            else if (key == "io_clk_out")     tp.io_clk_out = v;
+            else
+                log_warning("Unknown timing parameter '%s' in timing.cfg, ignoring.\n", key.c_str());
+        }
     }
 
     std::ifstream open_data_rel(const std::string &postfix)
@@ -491,7 +565,7 @@ struct FabulousImpl : ViaductAPI
             max_x = std::max(loc.x, max_x);
             max_y = std::max(loc.y, max_y);
             ctx->addPip(IdStringList::concat(src_tile, pip_name), pip_name, src_wire, dst_wire,
-                        ctx->getDelayFromNS(0.05 * delay), loc);
+                        ctx->getDelayFromNS(delay), loc);
         }
     }
 
